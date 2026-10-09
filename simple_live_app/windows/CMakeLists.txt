@@ -55,6 +55,14 @@ add_subdirectory("runner")
 
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
+#
+# 修复 VS 18 / MSVC 14.51 编译失败：
+#   插件 flutter_inappwebview_windows 使用 /await 实验性协程
+#   (<experimental/coroutine>)，而 MSVC 14.51 起把它的弃用警告升级为硬错误
+#   （error C2338 / STL1011）。微软官方给出的临时抑制宏如下。
+# 必须放在 include(generated_plugins.cmake) 之前，否则插件子目录不会继承该定义。
+add_compile_definitions(_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+
 include(flutter/generated_plugins.cmake)
 
 
