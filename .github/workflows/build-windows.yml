@@ -1,0 +1,115 @@
+name: Build Windows
+
+# 手动触发 + 推送本文件时自动跑一次
+# master 分支自 2026-01 起已停更，上游也只从 dev 构建 Windows，因此两个分支都支持
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, dev]
+    paths:
+      - ".github/workflows/build-windows.yml"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 从 .fvmrc 读取 Flutter 版本，master(3.38.3) / dev(3.47.1) 各自匹配
+      - name: Read Flutter version from .fvmrc
+        id: fvm
+        shell: bash
+        run: |
+          ver=$(grep -o '"flutter"[[:space:]]*:[[:space:]]*"[^"]*"' simple_live_app/.fvmrc | grep -o '[0-9][0-9.]*')
+          echo "version=$ver"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.fvm.outputs.version }}
+          channel: stable
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      # 仅打印诊断信息。CI 上没有 Android SDK，doctor 必然非零退出，不能让它拖垮构建
+      - name: Flutter doctor (诊断信息)
+        continue-on-error: true
+        run: flutter doctor -v
+
+      - name: Restore packages
+        working-directory: simple_live_app
+        run: flutter pub get
+
+      - name: Build Windows release
+        id: build
+        shell: bash
+        working-directory: simple_live_app
+        run: |
+          set -o pipefail
+          flutter build windows --release 2>&1 | tee build.log
+
+      # 失败时把日志尾部做成 annotation。annotation 无需登录即可通过公开 API 读取，
+      # 便于在拿不到 Actions 日志的环境下定位问题。
+      - name: Report failure log (annotation)
+        if: failure() && steps.build.outcome == 'failure'
+        shell: bash
+        run: |
+          LOG=simple_live_app/build.log
+          echo "===== 最后 80 行 ====="
+          tail -n 80 "$LOG" 2>/dev/null || echo "(build.log 不存在)"
+          if [ -f "$LOG" ]; then
+            MSG=$(tail -n 80 "$LOG" | sed 's/%/%25/g' | tr -d '\r' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=BuildLog::${MSG}"
+          fi
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: simple_live_app/build.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Package zip
+        if: steps.build.outcome == 'success'
+        shell: pwsh
+        run: |
+          $dir = Get-ChildItem -Path simple_live_app/build/windows -Directory -Recurse |
+                 Where-Object { $_.FullName -match 'runner\\Release$' } |
+                 Select-Object -First 1
+          if (-not $dir) { throw "找不到 Release 输出目录" }
+          Write-Host "打包目录: $($dir.FullName)"
+          Compress-Archive -Path "$($dir.FullName)\*" -DestinationPath simple-live-windows.zip -Force
+          Write-Host "产物: $([math]::Round((Get-Item simple-live-windows.zip).Length / 1MB, 1)) MB"
+
+      - name: Upload artifact
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: simple-live-windows
+          path: simple-live-windows.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      # 额外发一个 Release，免登录直接下载
+      - name: Publish release
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-${{ github.ref_name }}-${{ github.run_number }}
+          name: Windows (${{ github.ref_name }}) build ${{ github.run_number }}
+          body: |
+            自动构建的 Windows 版本（zip，解压后双击 simple_live_app.exe 即可运行）。
+            分支：${{ github.ref_name }}
+            Flutter：${{ steps.fvm.outputs.version }}
+          files: simple-live-windows.zip
+          draft: false
